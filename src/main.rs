@@ -1,4 +1,6 @@
 use futures::StreamExt;
+use sqlx::migrate::MigrateDatabase;
+use sqlx::sqlite::SqlitePoolOptions;
 use std::env;
 use std::fs;
 use std::net::SocketAddr;
@@ -19,6 +21,22 @@ async fn main() {
         .unwrap_or_else(|| "192.168.1.127:5009".to_string());
     let socket_address: SocketAddr = addr.parse().expect("unvalid socket address");
 
+    //BD
+    let uri = "sqlite://data.db";
+    let _ = sqlx::Sqlite::create_database(uri).await;
+    let pool = SqlitePoolOptions::new().connect(uri).await.unwrap();
+
+    let _create_users_table = sqlx::query(
+        "create table if not exists message (
+    id integer primary key autoincrement,
+    message_text text)",
+    )
+    .execute(&pool)
+    .await;
+
+    //pool.close().await;
+
+    //Server
     let users = Users::default();
     let users = warp::any().map(move || users.clone());
 
