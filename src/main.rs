@@ -1,18 +1,63 @@
+use fake::{faker::name::en::Name, Fake};
+
 use futures::StreamExt;
+use serde::Deserialize;
+use serde::Serialize;
 use sqlx::migrate::MigrateDatabase;
 use sqlx::sqlite::SqlitePoolOptions;
+use sqlx::FromRow;
 use std::env;
 use std::fs;
 use std::net::SocketAddr;
+use std::str::FromStr;
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::{mpsc, RwLock};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use warp::ws::{Message, WebSocket};
 use warp::Filter;
 
-static NEXT_USERID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+enum ActionEnum {
+    GetMessages,
+    AddMessage,
+}
 
+impl FromStr for ActionEnum {
+    type Err = ();
+
+    fn from_str(input: &str) -> Result<ActionEnum, Self::Err> {
+        match input {
+            "get_messages" => Ok(ActionEnum::GetMessages),
+            "add_message" => Ok(ActionEnum::AddMessage),
+            _ => Err(()),
+        }
+    }
+}
+
+impl ActionEnum {
+    pub fn value(self) -> String {
+        match self {
+            ActionEnum::GetMessages => "get_messages".to_string(),
+            ActionEnum::AddMessage => "add_message".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, FromRow)]
+struct DbMessage {
+    id: i64,
+    message: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Action<T> {
+    action: String,
+    data: T,
+}
+
+static NEXT_USERID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
 type Users = Arc<RwLock<HashMap<usize, mpsc::UnboundedSender<Result<Message, warp::Error>>>>>;
+
+static URI: &str = "sqlite://data.db";
 
 #[tokio::main]
 async fn main() {
@@ -22,9 +67,10 @@ async fn main() {
     let socket_address: SocketAddr = addr.parse().expect("unvalid socket address");
 
     //BD
-    let uri = "sqlite://data.db";
-    let _ = sqlx::Sqlite::create_database(uri).await;
-    let pool = SqlitePoolOptions::new().connect(uri).await.unwrap();
+
+    //let uri = "sqlite://data.db";
+    let _ = sqlx::Sqlite::create_database(URI).await;
+    let pool = SqlitePoolOptions::new().connect(URI).await.unwrap();
 
     let _create_users_table = sqlx::query(
         "create table if not exists message (
@@ -34,7 +80,18 @@ async fn main() {
     .execute(&pool)
     .await;
 
-    //pool.close().await;
+    // let mut stream = tokio_stream::iter(vec![0; 5000]);
+    // while let Some(_row) = stream.next().await {
+    //     sqlx::query(
+    //         "INSERT INTO message (message_text)
+    //         VALUES ($1)",
+    //     )
+    //     .bind(&(Name().fake::<String>()))
+    //     .execute(&pool)
+    //     .await;
+    // }
+
+    pool.close().await;
 
     //Server
     let users = Users::default();
@@ -88,8 +145,22 @@ async fn connect(ws: WebSocket, users: Users) {
 
     tokio::spawn(rx.forward(user_tx));
 
-    //
-    tx.send(Ok(Message::text("Start"))).expect("Какая-то лажа");
+    // DB --
+    let pool = SqlitePoolOptions::new().connect(URI).await.unwrap();
+    let select_query =
+        sqlx::query_as::<_, DbMessage>("SELECT id, message_text as message FROM message");
+    let messages: Vec<DbMessage> = select_query.fetch_all(&pool).await.unwrap();
+
+    let event = Action {
+        action: "get_messages".to_string(),
+        data: messages,
+    };
+
+    let result = serde_json::to_string(&event).unwrap();
+    dbg!(&result);
+
+    tx.send(Ok(Message::text(result))).expect("Какая-то лажа");
+    pool.close().await;
     //
 
     users.write().await.insert(my_id, tx);
@@ -97,7 +168,42 @@ async fn connect(ws: WebSocket, users: Users) {
     // Reading and broadcasting messages
     while let Some(result) = user_rx.next().await {
         if result.is_ok() {
-            broadcast_msg(result.expect("Failed to fetch message"), &users).await;
+            let in_message = result.unwrap();
+            let text = in_message.to_str().unwrap();
+            let action: Action<String> = serde_json::from_str(text).unwrap();
+            //dbg!(action);
+            match ActionEnum::from_str(action.action.as_str()) {
+                Ok(action_enum) => match action_enum {
+                    ActionEnum::GetMessages => {}
+                    ActionEnum::AddMessage => {
+                        let pool = SqlitePoolOptions::new().connect(URI).await.unwrap();
+                        let row: Result<DbMessage, sqlx::Error> = sqlx::query_as(
+                            "insert into message (message_text) values ($1) returning id, message_text as message",
+                        )
+                        .bind(action.data)
+                        .fetch_one(&pool)
+                        .await;
+
+                        pool.close().await;
+
+                        match row {
+                            Ok(message) => {
+                                let act = Action {
+                                    action: action_enum.value(),
+                                    data: message,
+                                };
+                                let msg = serde_json::to_string(&act).unwrap();
+                                broadcast_msg(Message::text(msg), &users).await;
+                            }
+                            Err(err) => {
+                                dbg!(err);
+                            }
+                        }
+                    }
+                },
+                Err(_) => {}
+            };
+            //broadcast_msg(result.expect("Failed to fetch message"), &users).await;
         } else {
             break;
         }
