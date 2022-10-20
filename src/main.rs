@@ -21,6 +21,7 @@ enum ActionEnum {
     GetMessages,
     AddMessage,
     DeleteMessage,
+    UpdateStatus,
 }
 
 impl FromStr for ActionEnum {
@@ -31,6 +32,7 @@ impl FromStr for ActionEnum {
             "get_messages" => Ok(ActionEnum::GetMessages),
             "add_message" => Ok(ActionEnum::AddMessage),
             "delete_message" => Ok(ActionEnum::DeleteMessage),
+            "update_status" => Ok(ActionEnum::UpdateStatus),
             _ => Err(()),
         }
     }
@@ -42,6 +44,7 @@ impl ActionEnum {
             ActionEnum::GetMessages => "get_messages".to_string(),
             ActionEnum::AddMessage => "add_message".to_string(),
             ActionEnum::DeleteMessage => "delete_message".to_string(),
+            ActionEnum::UpdateStatus => "update_status".to_string(),
         }
     }
 }
@@ -50,6 +53,7 @@ impl ActionEnum {
 struct DbMessage {
     id: i64,
     message: String,
+    status: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -77,7 +81,8 @@ async fn main() {
     let _create_task_table = sqlx::query(
         "create table if not exists message (
     id integer primary key autoincrement,
-    message_text text)",
+    message_text text,
+    status varchar(12) default wait not null)",
     )
     .execute(&pool)
     .await;
@@ -150,7 +155,7 @@ async fn connect(ws: WebSocket, users: Users) {
     // DB --
     let pool = SqlitePoolOptions::new().connect(URI).await.unwrap();
     let select_query = sqlx::query_as::<_, DbMessage>(
-        "SELECT id, message_text as message 
+        "SELECT id, message_text as message, status 
         FROM message",
     );
     let messages: Vec<DbMessage> = select_query.fetch_all(&pool).await.unwrap();
@@ -186,7 +191,7 @@ async fn connect(ws: WebSocket, users: Users) {
                         let action: Action<String> = serde_json::from_str(text).unwrap();
                         let pool = SqlitePoolOptions::new().connect(URI).await.unwrap();
                         let row: Result<DbMessage, sqlx::Error> = sqlx::query_as(
-                            "insert into message (message_text) values ($1) returning id, message_text as message",
+                            "insert into message (message_text) values ($1) returning id, message_text as message, status",
                         )
                         .bind(action.data)
                         .fetch_one(&pool)
@@ -214,8 +219,39 @@ async fn connect(ws: WebSocket, users: Users) {
                         dbg!(id);
                         let pool = SqlitePoolOptions::new().connect(URI).await.unwrap();
                         let row: Result<DbMessage, sqlx::Error> =
-                            sqlx::query_as("delete from message where message.id = ($1) returning id, message_text as message")
+                            sqlx::query_as("delete from message where message.id = ($1) returning id, message_text as message, status")
                                 .bind(id)
+                                .fetch_one(&pool)
+                                .await;
+
+                        pool.close().await;
+
+                        match row {
+                            Ok(message) => {
+                                let act = Action {
+                                    action: action_enum.value(),
+                                    data: message,
+                                };
+                                let msg = serde_json::to_string(&act).unwrap();
+                                broadcast_msg(Message::text(msg), &users).await;
+                            }
+                            Err(err) => {
+                                dbg!(err);
+                            }
+                        }
+                    }
+                    ActionEnum::UpdateStatus => {
+                        let action: Action<DbMessage> = serde_json::from_str(text).unwrap();
+                        let id = action.data.id;
+                        dbg!(id);
+                        let status = action.data.status;
+                        dbg!(&status);
+
+                        let pool = SqlitePoolOptions::new().connect(URI).await.unwrap();
+                        let row: Result<DbMessage, sqlx::Error> =
+                            sqlx::query_as("update message set status = ($2) where message.id = ($1) returning id, message_text as message, status")
+                                .bind(id)
+                                .bind(status)
                                 .fetch_one(&pool)
                                 .await;
 
